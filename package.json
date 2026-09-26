@@ -1,0 +1,17 @@
+{
+  "name": "pkm-battle-relay",
+  "version": "1.0.0",
+  "description": "Server relay toi gian cho PvP battle - ghep tran, dieu phoi luot, tuyen bo thang thua. Khong tinh sat thuong, khong cham quiz.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.8.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
