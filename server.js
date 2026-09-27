@@ -34,9 +34,11 @@ const TEAM_SELECT_TIMEOUT_MS = 45 * 1000;
 const ANSWER_TIMEOUT_MS = 25 * 1000; // mỗi vòng chờ tối đa 25s/bên
 const CHALLENGE_TIMEOUT_MS = 10 * 1000; // 10s không phản hồi lời thách đấu = coi như từ chối
 
-// Tổng chỉ số công bằng khi ĐỦ 3 con (2 hoặc 1 con sẽ nhân theo tỉ lệ N/3)
-// -> khởi điểm để ước lượng ~15 câu/bên, CHỈNH TAY SAU KHI TEST THỬ.
-const FAIR_TOTALS = { hp: 1500, dmg: 200, def: 150 };
+// Tổng chỉ số công bằng khi ĐỦ 3 con (2 hoặc 1 con sẽ nhân theo tỉ lệ N/3).
+// dmgNormal và dmgAoe là 2 QUỸ ĐỘC LẬP (giống bản offline: atk và sAtk là
+// 2 chỉ số tách biệt, không gộp chung) -> khởi điểm để ước lượng ~15
+// câu/bên, CHỈNH TAY SAU KHI TEST THỬ.
+const FAIR_TOTALS = { hp: 1500, dmgNormal: 200, dmgAoe: 200, def: 150 };
 
 app.get("/", (req, res) => res.send("PKM Battle server is running."));
 app.get("/health", (req, res) => res.json({ ok: true, time: Date.now() }));
@@ -92,29 +94,30 @@ function computeDamage(attacker, defender, isAOE) {
 }
 
 // ===================== QUY ĐỔI CHỈ SỐ CÔNG BẰNG =====================
+// 4 chỉ số HP / ATK (đòn thường) / sATK (đòn AOE) / DEF quy đổi ĐỘC LẬP
+// với nhau — giống hệt bản offline (atk và sAtk là 2 chỉ số tách biệt).
 function normalizeTeam(rawUnits) {
   const n = rawUnits.length;
   const scale = n / MAX_TEAM_SIZE;
   const targetHP = FAIR_TOTALS.hp * scale;
-  const targetDMG = FAIR_TOTALS.dmg * scale;
+  const targetDmgNormal = FAIR_TOTALS.dmgNormal * scale;
+  const targetDmgAoe = FAIR_TOTALS.dmgAoe * scale;
   const targetDEF = FAIR_TOTALS.def * scale;
 
   const sumHP = rawUnits.reduce((s, u) => s + (u.hp || 0), 0) || 1;
-  const sumDMG = rawUnits.reduce((s, u) => s + (u.atk || 0) + (u.sAtk || 0), 0) || 1;
+  const sumAtk = rawUnits.reduce((s, u) => s + (u.atk || 0), 0) || 1;
+  const sumSAtk = rawUnits.reduce((s, u) => s + (u.sAtk || 0), 0) || 1;
   const sumDEF = rawUnits.reduce((s, u) => s + (u.def || 0), 0) || 1;
 
   return rawUnits.map(u => {
     const hp = Math.max(1, Math.round(targetHP * ((u.hp || 0) / sumHP)));
-    const dmgTotal = (u.atk || 0) + (u.sAtk || 0);
-    const dmgShare = targetDMG * (dmgTotal / sumDMG);
-    const ratio = dmgTotal > 0 ? (u.atk || 0) / dmgTotal : 0.5;
     return {
       id: u.id,
       name: u.name || u.id,
       type: u.type || "normal",
       hp, maxHp: hp,
-      atk: Math.max(1, Math.round(dmgShare * ratio)),
-      sAtk: Math.max(1, Math.round(dmgShare * (1 - ratio))),
+      atk: Math.max(1, Math.round(targetDmgNormal * ((u.atk || 0) / sumAtk))),
+      sAtk: Math.max(1, Math.round(targetDmgAoe * ((u.sAtk || 0) / sumSAtk))),
       def: Math.max(1, Math.round(targetDEF * ((u.def || 0) / sumDEF))),
       alive: true,
     };
