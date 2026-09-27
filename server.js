@@ -36,7 +36,7 @@ const CHALLENGE_TIMEOUT_MS = 10 * 1000; // 10s không phản hồi lời thách 
 
 // Tổng chỉ số công bằng khi ĐỦ 3 con (2 hoặc 1 con sẽ nhân theo tỉ lệ N/3)
 // -> khởi điểm để ước lượng ~15 câu/bên, CHỈNH TAY SAU KHI TEST THỬ.
-const FAIR_TOTALS = { hp: 3000, dmg: 260, def: 150 };
+const FAIR_TOTALS = { hp: 1500, dmg: 200, def: 150 };
 
 app.get("/", (req, res) => res.send("PKM Battle server is running."));
 app.get("/health", (req, res) => res.json({ ok: true, time: Date.now() }));
