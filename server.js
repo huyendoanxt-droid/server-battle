@@ -32,6 +32,7 @@ const QUEUE_TIMEOUT_MS = 2 * 60 * 1000;
 const RECONNECT_GRACE_MS = 60 * 1000;
 const TEAM_SELECT_TIMEOUT_MS = 45 * 1000;
 const ANSWER_TIMEOUT_MS = 25 * 1000; // mỗi vòng chờ tối đa 25s/bên
+const CHALLENGE_TIMEOUT_MS = 10 * 1000; // 10s không phản hồi lời thách đấu = coi như từ chối
 
 // Tổng chỉ số công bằng khi ĐỦ 3 con (2 hoặc 1 con sẽ nhân theo tỉ lệ N/3)
 // -> khởi điểm để ước lượng ~15 câu/bên, CHỈNH TAY SAU KHI TEST THỬ.
@@ -40,12 +41,17 @@ const FAIR_TOTALS = { hp: 3000, dmg: 260, def: 150 };
 app.get("/", (req, res) => res.send("PKM Battle server is running."));
 app.get("/health", (req, res) => res.json({ ok: true, time: Date.now() }));
 
-// Số liệu hiển thị ở màn chờ ghép trận: bao nhiêu người đang chờ, bao
-// nhiêu trận đang diễn ra. Không có gì nhạy cảm, cho phép gọi tự do.
+// Số liệu hiển thị ở màn chờ ghép trận: bao nhiêu người đang chờ (kèm
+// tên), và đang có những cặp nào đấu với nhau. Chỉ hiện TÊN, không lộ
+// playerId/roomId nội bộ.
 app.get("/stats", (req, res) => {
   res.json({
     waiting: waitingQueue.length,
-    activeMatches: rooms.size,
+    waitingNames: waitingQueue.map(e => e.name || "Ẩn danh"),
+    activeMatches: [...rooms.values()].map(r => ({
+      a: r.players[0]?.name || "Ẩn danh",
+      b: r.players[1]?.name || "Ẩn danh",
+    })),
     time: Date.now(),
   });
 });
@@ -119,6 +125,90 @@ function normalizeTeam(rawUnits) {
 let waitingQueue = [];
 const rooms = new Map();
 
+// Khu vực chờ (lobby): playerId -> thông tin + trạng thái hiện tại.
+// status: 'idle' (rảnh, có thể bị thách đấu) | 'searching' (đang xếp
+// hàng ghép ngẫu nhiên) | 'in_match' (đang thi đấu, không thể thách đấu).
+// forcedAcceptNext: true nếu người này vừa từ chối/lờ đi 1 lời mời trước
+// đó -> lời mời TIẾP THEO từ BẤT KỲ AI sẽ được tự động chấp nhận ngay.
+// queuedChallengeFrom: nếu người này đang bận (in_match) mà bị 1 người có
+// vé "forcedAccept" nhắm tới, lời mời đó được giữ lại, tự ghép ngay khi rảnh.
+const onlineUsers = new Map();
+
+// Lời mời đang chờ phản hồi: toPlayerId -> { fromPlayerId, timer }
+const pendingChallenges = new Map();
+
+function broadcastLobby() {
+  const list = [...onlineUsers.values()].map(u => ({
+    playerId: u.playerId, name: u.name, className: u.className, status: u.status,
+  }));
+  io.emit("lobby:update", { users: list });
+}
+
+function clearPendingChallengeFor(playerId) {
+  const p = pendingChallenges.get(playerId);
+  if (p) { clearTimeout(p.timer); pendingChallenges.delete(playerId); }
+}
+
+// Nếu người này vừa rảnh (idle) mà đang có 1 lời mời bị "giữ lại" từ lúc
+// bận -> tự ghép trận ngay, không cần hỏi lại (đúng luật "vé bắt buộc nhận").
+function tryConsumeQueuedChallenge(playerId) {
+  const target = onlineUsers.get(playerId);
+  if (!target || !target.queuedChallengeFrom) return;
+  const fromId = target.queuedChallengeFrom;
+  target.queuedChallengeFrom = null;
+  target.forcedAcceptNext = false;
+  const fromEntry = onlineUsers.get(fromId);
+  if (!fromEntry || fromEntry.status === "in_match") return; // người mời đã rời/đang bận -> bỏ qua
+  removeFromQueue(fromEntry.socketId);
+  removeFromQueue(target.socketId);
+  createRoom(fromEntry, target);
+}
+
+// Tạo phòng trực tiếp cho 2 người cụ thể (dùng chung cho: ghép ngẫu nhiên
+// FIFO, thách đấu được chấp nhận, và vé "bắt buộc nhận" được tiêu thụ).
+function createRoom(a, b) {
+  const unitsAllowed = Math.min(MAX_TEAM_SIZE, a.ownedCount || MAX_TEAM_SIZE, b.ownedCount || MAX_TEAM_SIZE);
+  const roomId = makeRoomId();
+  const room = {
+    roomId, unitsAllowed,
+    players: [
+      { playerId: a.playerId, socketId: a.socketId, name: a.name, rawTeam: null },
+      { playerId: b.playerId, socketId: b.socketId, name: b.name, rawTeam: null },
+    ],
+    teams: {}, turnCounter: 0, ended: false,
+    pendingActions: {}, reconnectTimers: {}, teamSelectTimeout: null, answerTimer: null,
+  };
+  rooms.set(roomId, room);
+
+  const sockA = io.sockets.sockets.get(a.socketId);
+  const sockB = io.sockets.sockets.get(b.socketId);
+  if (sockA) { sockA.join(roomId); sockA.data.roomId = roomId; sockA.data.playerId = a.playerId; }
+  if (sockB) { sockB.join(roomId); sockB.data.roomId = roomId; sockB.data.playerId = b.playerId; }
+
+  io.to(a.socketId).emit("match:found", { roomId, unitsAllowed, opponentId: b.playerId });
+  io.to(b.socketId).emit("match:found", { roomId, unitsAllowed, opponentId: a.playerId });
+
+  [a.playerId, b.playerId].forEach(pid => {
+    const u = onlineUsers.get(pid);
+    if (u) { u.status = "in_match"; u.queuedChallengeFrom = null; }
+  });
+  broadcastLobby();
+
+  room.teamSelectTimeout = setTimeout(() => {
+    if (!room.players.every(p => p.rawTeam)) {
+      io.to(roomId).emit("match:cancelled", { reason: "team_select_timeout" });
+      rooms.delete(roomId);
+      [a.playerId, b.playerId].forEach(pid => {
+        const u = onlineUsers.get(pid);
+        if (u) u.status = "idle";
+      });
+      broadcastLobby();
+    }
+  }, TEAM_SELECT_TIMEOUT_MS);
+
+  return room;
+}
+
 function makeRoomId() {
   return "room_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
@@ -142,6 +232,13 @@ function endRoom(room, winnerId, reason) {
   clearRoomTimers(room);
   io.to(room.roomId).emit("battle:end", { winnerId, reason });
   rooms.delete(room.roomId);
+
+  room.players.forEach(p => {
+    const u = onlineUsers.get(p.playerId);
+    if (u) u.status = "idle";
+  });
+  broadcastLobby();
+  room.players.forEach(p => tryConsumeQueuedChallenge(p.playerId));
 }
 
 function publicState(room) {
@@ -210,19 +307,26 @@ function currentIsAOE(room) {
 
 function scheduleAnswerTimeout(room) {
   if (room.answerTimer) clearTimeout(room.answerTimer);
-  room.answerTimer = setTimeout(() => resolveTurn(room, primaryPlayerId(room), false), ANSWER_TIMEOUT_MS);
+  room.pendingActions = {};
+  // Hết 25s mà bên nào chưa trả lời -> tự tính người đó là SAI, rồi xử lý lượt luôn.
+  room.answerTimer = setTimeout(() => resolveTurn(room), ANSWER_TIMEOUT_MS);
 }
 
-// primaryAnswerCorrect: kết quả câu trả lời của bên CHÍNH lượt này (bắt buộc).
-function resolveTurn(room, primaryId, primaryCorrect) {
+// Lượt chỉ được xử lý khi CẢ 2 bên đã trả lời (hoặc hết 25s) — nhưng chỉ
+// câu trả lời của bên CHÍNH mới quyết định đòn đánh; bên PHỤ chỉ là điều
+// kiện để "khoá" lượt cho đồng bộ nhịp, không ảnh hưởng kết quả.
+function resolveTurn(room) {
   if (room.ended) return;
   if (room.answerTimer) clearTimeout(room.answerTimer);
 
+  const primaryId = primaryPlayerId(room);
+  const [pidA, pidB] = room.players.map(p => p.playerId);
+  if (!room.pendingActions[pidA]) room.pendingActions[pidA] = { correct: false };
+  if (!room.pendingActions[pidB]) room.pendingActions[pidB] = { correct: false };
+
   const isAOE = currentIsAOE(room);
   const defenderId = otherPlayer(room, primaryId).playerId;
-
-  room.pendingActions = { [primaryId]: { correct: !!primaryCorrect } };
-  applyAttack(room, primaryId, defenderId, isAOE);
+  applyAttack(room, primaryId, defenderId, isAOE); // tự kiểm tra pendingActions[primaryId].correct bên trong
 
   room.turnCounter += 1;
   room.pendingActions = {};
@@ -237,58 +341,140 @@ function resolveTurn(room, primaryId, primaryCorrect) {
   }
 }
 
+// Hết 10s không phản hồi (hoặc từ chối tay) -> gắn vé "bắt buộc nhận lần
+// sau" cho người bị mời, báo cho người mời biết bị từ chối.
+function resolveChallengeTimeout(toPlayerId) {
+  const pending = pendingChallenges.get(toPlayerId);
+  if (!pending) return;
+  pendingChallenges.delete(toPlayerId);
+  const target = onlineUsers.get(toPlayerId);
+  if (target) target.forcedAcceptNext = true;
+  const fromEntry = onlineUsers.get(pending.fromPlayerId);
+  if (fromEntry) io.to(fromEntry.socketId).emit("challenge:declined", { toPlayerId });
+  broadcastLobby();
+}
+
 // ===================== SOCKET.IO =====================
 io.on("connection", socket => {
 
-  socket.on("queue:join", ({ playerId, ownedCount }) => {
+  // ---------- KHU VỰC CHỜ (lobby) ----------
+  // Gọi ngay khi vào trang online — đăng ký hiện diện, hiện trong danh
+  // sách "ai đang online" để người khác thách đấu được.
+  socket.on("lobby:join", ({ playerId, name, className, ownedCount }) => {
+    if (!playerId) return;
+    socket.data.playerId = playerId;
+    const safeName = (typeof name === "string" && name.trim()) ? name.trim().slice(0, 30) : "Ẩn danh";
+    const safeClass = (typeof className === "string" && className.trim()) ? className.trim().slice(0, 20) : null;
+    const safeOwned = Math.max(1, Math.min(MAX_TEAM_SIZE, parseInt(ownedCount, 10) || 1));
+    const existing = onlineUsers.get(playerId);
+    onlineUsers.set(playerId, {
+      playerId, socketId: socket.id, name: safeName, className: safeClass, ownedCount: safeOwned,
+      status: existing?.status === "in_match" ? "in_match" : "idle",
+      forcedAcceptNext: existing?.forcedAcceptNext || false,
+      queuedChallengeFrom: existing?.queuedChallengeFrom || null,
+    });
+    broadcastLobby();
+  });
+
+  socket.on("queue:join", ({ playerId, ownedCount, name }) => {
     if (!playerId) return;
     removeFromQueue(socket.id);
     const safeOwned = Math.max(1, Math.min(MAX_TEAM_SIZE, parseInt(ownedCount, 10) || 1));
-    const entry = { socketId: socket.id, playerId, ownedCount: safeOwned, timeoutHandle: null };
-    waitingQueue.push(entry);
+    const safeName = (typeof name === "string" && name.trim()) ? name.trim().slice(0, 30) : "Ẩn danh";
     socket.data.playerId = playerId;
+
+    const existing = onlineUsers.get(playerId);
+    onlineUsers.set(playerId, {
+      ...(existing || {}), playerId, socketId: socket.id, name: safeName, ownedCount: safeOwned,
+      className: existing?.className || null, status: "searching",
+      forcedAcceptNext: existing?.forcedAcceptNext || false,
+      queuedChallengeFrom: existing?.queuedChallengeFrom || null,
+    });
+    broadcastLobby();
+
+    const entry = { socketId: socket.id, playerId, ownedCount: safeOwned, name: safeName, timeoutHandle: null };
+    waitingQueue.push(entry);
 
     if (waitingQueue.length >= 2) {
       const a = waitingQueue.shift();
       const b = waitingQueue.shift();
       clearQueueEntry(a); clearQueueEntry(b);
-
-      const unitsAllowed = Math.min(MAX_TEAM_SIZE, a.ownedCount, b.ownedCount);
-      const roomId = makeRoomId();
-      const room = {
-        roomId, unitsAllowed,
-        players: [
-          { playerId: a.playerId, socketId: a.socketId, rawTeam: null },
-          { playerId: b.playerId, socketId: b.socketId, rawTeam: null },
-        ],
-        teams: {}, turnCounter: 0, ended: false,
-        pendingActions: {}, reconnectTimers: {}, teamSelectTimeout: null, answerTimer: null,
-      };
-      rooms.set(roomId, room);
-
-      const sockA = io.sockets.sockets.get(a.socketId);
-      const sockB = io.sockets.sockets.get(b.socketId);
-      if (sockA) { sockA.join(roomId); sockA.data.roomId = roomId; }
-      if (sockB) { sockB.join(roomId); sockB.data.roomId = roomId; }
-
-      io.to(a.socketId).emit("match:found", { roomId, unitsAllowed, opponentId: b.playerId });
-      io.to(b.socketId).emit("match:found", { roomId, unitsAllowed, opponentId: a.playerId });
-
-      room.teamSelectTimeout = setTimeout(() => {
-        if (!room.players.every(p => p.rawTeam)) {
-          io.to(roomId).emit("match:cancelled", { reason: "team_select_timeout" });
-          rooms.delete(roomId);
-        }
-      }, TEAM_SELECT_TIMEOUT_MS);
+      createRoom(a, b);
     } else {
       entry.timeoutHandle = setTimeout(() => {
         removeFromQueue(socket.id);
+        const u = onlineUsers.get(playerId);
+        if (u) { u.status = "idle"; broadcastLobby(); }
         io.to(socket.id).emit("queue:timeout");
       }, QUEUE_TIMEOUT_MS);
     }
   });
 
-  socket.on("queue:cancel", () => removeFromQueue(socket.id));
+  socket.on("queue:cancel", () => {
+    removeFromQueue(socket.id);
+    const playerId = socket.data.playerId;
+    const u = playerId && onlineUsers.get(playerId);
+    if (u && u.status === "searching") { u.status = "idle"; broadcastLobby(); }
+  });
+
+  // ---------- THÁCH ĐẤU TRỰC TIẾP ----------
+  socket.on("challenge:send", ({ toPlayerId, message }) => {
+    const fromId = socket.data.playerId;
+    if (!fromId || !toPlayerId || fromId === toPlayerId) return;
+    const from = onlineUsers.get(fromId);
+    const target = onlineUsers.get(toPlayerId);
+    if (!from) return;
+    if (!target) { io.to(from.socketId).emit("challenge:error", { reason: "offline" }); return; }
+
+    const safeMsg = (typeof message === "string" ? message : "").slice(0, 200);
+
+    // Vé "bắt buộc nhận" đang có hiệu lực với người này
+    if (target.forcedAcceptNext) {
+      if (target.status === "idle") {
+        target.forcedAcceptNext = false;
+        removeFromQueue(from.socketId); removeFromQueue(target.socketId);
+        createRoom(from, target);
+      } else {
+        // Đang bận (in_match) -> giữ lại lời mời, tự ghép ngay khi họ rảnh
+        target.queuedChallengeFrom = fromId;
+        io.to(from.socketId).emit("challenge:queued", { toPlayerId });
+      }
+      return;
+    }
+
+    if (target.status !== "idle") {
+      io.to(from.socketId).emit("challenge:error", { reason: "busy" });
+      return;
+    }
+    if (pendingChallenges.has(toPlayerId)) {
+      io.to(from.socketId).emit("challenge:error", { reason: "already_pending" });
+      return;
+    }
+
+    const timer = setTimeout(() => resolveChallengeTimeout(toPlayerId), CHALLENGE_TIMEOUT_MS);
+    pendingChallenges.set(toPlayerId, { fromPlayerId: fromId, timer });
+    io.to(target.socketId).emit("challenge:incoming", { fromPlayerId: fromId, fromName: from.name, message: safeMsg });
+    io.to(from.socketId).emit("challenge:sent", { toPlayerId });
+  });
+
+  socket.on("challenge:accept", ({ fromPlayerId }) => {
+    const myId = socket.data.playerId;
+    if (!myId) return;
+    const pending = pendingChallenges.get(myId);
+    if (!pending || pending.fromPlayerId !== fromPlayerId) return; // lời mời đã hết hạn/không khớp
+    clearPendingChallengeFor(myId);
+    const fromEntry = onlineUsers.get(fromPlayerId);
+    const myEntry = onlineUsers.get(myId);
+    if (!fromEntry || !myEntry) return;
+    removeFromQueue(fromEntry.socketId); removeFromQueue(myEntry.socketId);
+    createRoom(fromEntry, myEntry);
+  });
+
+  socket.on("challenge:decline", () => {
+    const myId = socket.data.playerId;
+    if (!myId || !pendingChallenges.has(myId)) return;
+    resolveChallengeTimeout(myId); // từ chối tay = giống hệt hết giờ (bị gắn vé bắt buộc nhận lần sau)
+  });
 
   socket.on("team:submit", ({ roomId, team }) => {
     const room = rooms.get(roomId);
@@ -319,11 +505,17 @@ io.on("connection", socket => {
     if (!room || room.ended) return;
     if (turnCounter !== room.turnCounter) return; // trả lời trễ của lượt cũ -> bỏ qua
     const pid = socket.data.playerId;
-    if (!pid) return;
+    if (!pid || room.pendingActions[pid]) return; // đã gửi rồi -> bỏ qua lần gửi thêm
 
-    const primaryId = primaryPlayerId(room);
-    if (pid !== primaryId) return; // bên PHỤ gửi lên -> không ảnh hưởng, bỏ qua luôn
-    resolveTurn(room, primaryId, !!correct);
+    // Ghi nhận câu trả lời của người này (dù CHÍNH hay PHỤ). Kết quả đòn
+    // đánh CHỈ phụ thuộc câu trả lời của bên CHÍNH (xử lý trong resolveTurn) —
+    // nhưng lượt chỉ được xử lý khi CẢ 2 đã trả lời (hoặc hết 25s).
+    room.pendingActions[pid] = { correct: !!correct };
+
+    const [pidA, pidB] = room.players.map(p => p.playerId);
+    if (room.pendingActions[pidA] && room.pendingActions[pidB]) {
+      resolveTurn(room);
+    }
   });
 
   socket.on("room:rejoin", ({ roomId, playerId }) => {
@@ -342,6 +534,9 @@ io.on("connection", socket => {
       delete room.reconnectTimers[playerId];
     }
 
+    const uu = onlineUsers.get(playerId);
+    if (uu) uu.socketId = socket.id; // cập nhật socket mới sau khi rejoin
+
     socket.emit("room:rejoin_ok", { unitsAllowed: room.unitsAllowed, ...publicState(room) });
     const opp = otherPlayer(room, playerId);
     if (opp) io.to(opp.socketId).emit("opponent:reconnected");
@@ -351,7 +546,17 @@ io.on("connection", socket => {
     removeFromQueue(socket.id);
     const roomId = socket.data.roomId;
     const playerId = socket.data.playerId;
-    if (!roomId || !playerId) return;
+
+    if (!roomId) {
+      // Không ở trong trận nào -> dọn khỏi khu vực chờ ngay lập tức
+      if (playerId) {
+        onlineUsers.delete(playerId);
+        clearPendingChallengeFor(playerId);
+        broadcastLobby();
+      }
+      return;
+    }
+    if (!playerId) return;
     const room = rooms.get(roomId);
     if (!room || room.ended) return;
 
