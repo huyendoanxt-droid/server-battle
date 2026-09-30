@@ -47,6 +47,23 @@ const CHALLENGE_COOLDOWN_MS = 2000;             // chống bấm gửi lời m�
 const PRESENCE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS) || 10 * 1000; // mất kết nối bao lâu thì coi là offline
 const QUEUED_CHALLENGE_TTL_MS = 2 * 60 * 1000;  // lời mời giữ lại cho người đang bận
 const LIST_LIMIT = 150;                         // tối đa số người trả về mỗi lần hỏi
+const CHAT_LIMIT_PER_FRIEND = 3;                // tối đa số tin nhắn GỬI cho 1 người/phiên
+
+// Hàng rào đầu tiên, KHÔNG phải chặn tuyệt đối — học sinh vẫn có thể né bằng
+// cách viết cách chữ, viết tắt khác, chèn ký tự... Chấp nhận đây là bộ lọc cơ bản.
+// LƯU Ý: đã bỏ những từ ngắn trùng với từ tiếng Việt bình thường khi gõ KHÔNG
+// DẤU (vd "cac"="các", "lon"="lớn", "di"="đi", "buoi"="buổi") để tránh chặn
+// nhầm câu nói vô hại — chỉ giữ từ có dấu đầy đủ (ít trùng) hoặc từ lóng
+// mạng không trùng nghĩa nào khác. Bạn tự thêm/bớt cho khớp thực tế lớp mình.
+const BANNED_WORDS = ["đm", "đmm", "đệch", "đệt", "đéo", "địt", "đjt", "cút", "vcl", "clgt", "đĩ", "lồn", "buồi", "cặc"];
+function filterProfanity(text) {
+  let out = text;
+  BANNED_WORDS.forEach(w => {
+    const re = new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    out = out.replace(re, m => "*".repeat(m.length));
+  });
+  return out;
+}
 
 // dmgNormal và dmgAoe là 2 QUỸ ĐỘC LẬP (giống bản offline: atk và sAtk là
 // 2 chỉ số tách biệt). Áp dụng cho ĐỦ 3 con; 2 hoặc 1 con nhân theo N/3.
@@ -415,6 +432,7 @@ function registerUser(socket, d) {
     forcedAcceptNext: existing ? existing.forcedAcceptNext : false,
     queuedChallenge: existing ? existing.queuedChallenge : null,
     lastChallengeAt: existing ? existing.lastChallengeAt : 0,
+    chatCounts: existing ? existing.chatCounts : {}, // reset về 0 khi rời hẳn (removeUser) rồi vào lại
   };
   if (u.inRoomId && !rooms.has(u.inRoomId)) u.inRoomId = null;
   onlineUsers.set(playerId, u);
@@ -583,6 +601,29 @@ io.on("connection", socket => {
       if (u && u.connected) users.push(publicUser(u));
     });
     ack({ users });
+  });
+
+  // ---------- NHẮN TIN: chỉ giữa bạn bè (client tự đảm bảo), tối đa
+  // CHAT_LIMIT_PER_FRIEND tin GỬI cho mỗi người/phiên, không lưu trữ. ----------
+  on(socket, "chat:send", d => {
+    const me = getMe(socket);
+    if (!me || !d) return;
+    const toId = str(d.toPlayerId, 80);
+    const text = str(d.text, 300);
+    if (!toId || !text || toId === me.playerId) return;
+
+    const target = onlineUsers.get(toId);
+    if (!target || !target.connected) return emitTo(me, "chat:error", { toPlayerId: toId, reason: "offline" });
+
+    me.chatCounts = me.chatCounts || {};
+    const used = me.chatCounts[toId] || 0;
+    if (used >= CHAT_LIMIT_PER_FRIEND) return emitTo(me, "chat:error", { toPlayerId: toId, reason: "limit" });
+
+    const clean = filterProfanity(text);
+    me.chatCounts[toId] = used + 1;
+    const remaining = CHAT_LIMIT_PER_FRIEND - me.chatCounts[toId];
+    emitTo(target, "chat:message", { fromPlayerId: me.playerId, fromName: me.name, text: clean });
+    emitTo(me, "chat:sent", { toPlayerId: toId, text: clean, remaining });
   });
 
   // ---------- BẠN BÈ: chỉ chuyển tiếp thông báo (dữ liệu nằm ở Firestore) ----------
