@@ -37,13 +37,14 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // ===================== CẤU HÌNH (chỉnh tay được) =====================
-const MAX_TEAM_SIZE = 3;
+const MAX_TEAM_SIZE = 2;                        // đổi từ 3 xuống 2
 const QUEUE_TIMEOUT_MS = 2 * 60 * 1000;         // chờ ghép ngẫu nhiên tối đa
 const RECONNECT_GRACE_MS = 60 * 1000;           // rớt mạng giữa trận: chờ nối lại
 const TEAM_SELECT_TIMEOUT_MS = 60 * 1000;       // thời gian chọn đội hình sau khi ghép
-const ANSWER_TIMEOUT_MS = 25 * 1000;            // mỗi lượt chờ tối đa/bên
-const CHALLENGE_TIMEOUT_MS = Number(process.env.CHALLENGE_TIMEOUT_MS) || 10 * 1000; // 10s không phản hồi = từ chối
+const ANSWER_TIMEOUT_MS = 30 * 1000;            // mỗi lượt chờ tối đa/bên (từ 25s -> 30s)
+const CHALLENGE_TIMEOUT_MS = Number(process.env.CHALLENGE_TIMEOUT_MS) || 10 * 1000; // 10 GIÂY không phản hồi 1 lời mời = từ chối (không đổi)
 const CHALLENGE_COOLDOWN_MS = 2000;             // chống bấm gửi lời mời liên tục
+const FORCE_ACCEPT_AFTER_DECLINES = 10;         // từ chối/lờ đủ 10 LẦN (đếm dồn, không phải giây) mới bị gắn vé ép nhận lần kế
 const PRESENCE_GRACE_MS = Number(process.env.PRESENCE_GRACE_MS) || 10 * 1000; // mất kết nối bao lâu thì coi là offline
 const QUEUED_CHALLENGE_TTL_MS = 2 * 60 * 1000;  // lời mời giữ lại cho người đang bận
 const LIST_LIMIT = 150;                         // tối đa số người trả về mỗi lần hỏi
@@ -66,7 +67,8 @@ function filterProfanity(text) {
 }
 
 // dmgNormal và dmgAoe là 2 QUỸ ĐỘC LẬP (giống bản offline: atk và sAtk là
-// 2 chỉ số tách biệt). Áp dụng cho ĐỦ 3 con; 2 hoặc 1 con nhân theo N/3.
+// 2 chỉ số tách biệt). ÁP DỤNG NGUYÊN, KHÔNG NHÂN TỈ LỆ dù 1 hay 2 con —
+// 1 con cũng có tổng máu/damage/def y hệt 2 con (gánh hết 1 mình).
 const FAIR_TOTALS = { hp: 3000, dmgNormal: 260, dmgAoe: 260, def: 150 };
 
 // ===================== TIỆN ÍCH =====================
@@ -123,12 +125,12 @@ function computeDamage(attacker, defender, isAOE) {
 
 // ===================== QUY ĐỔI CHỈ SỐ CÔNG BẰNG =====================
 function normalizeTeam(rawUnits) {
-  const n = rawUnits.length;
-  const scale = n / MAX_TEAM_SIZE;
-  const targetHP = FAIR_TOTALS.hp * scale;
-  const targetDmgNormal = FAIR_TOTALS.dmgNormal * scale;
-  const targetDmgAoe = FAIR_TOTALS.dmgAoe * scale;
-  const targetDEF = FAIR_TOTALS.def * scale;
+  // KHÔNG nhân theo n/MAX_TEAM_SIZE nữa — 1 con hay 2 con đều dùng ĐỦ
+  // FAIR_TOTALS, chỉ khác là 1 con phải gánh hết tổng đó một mình.
+  const targetHP = FAIR_TOTALS.hp;
+  const targetDmgNormal = FAIR_TOTALS.dmgNormal;
+  const targetDmgAoe = FAIR_TOTALS.dmgAoe;
+  const targetDEF = FAIR_TOTALS.def;
 
   const sumHP = rawUnits.reduce((s, u) => s + (u.hp || 0), 0) || 1;
   const sumAtk = rawUnits.reduce((s, u) => s + (u.atk || 0), 0) || 1;
@@ -381,19 +383,38 @@ function scheduleAnswerTimeout(room) {
   }, ANSWER_TIMEOUT_MS);
 }
 
-// Lượt chỉ được xử lý khi CẢ 2 bên đã trả lời (hoặc hết 25s). Chỉ câu trả lời
+// Lượt chỉ được xử lý khi CẢ 2 bên đã trả lời (hoặc hết 30s). Chỉ câu trả lời
 // của bên CHÍNH quyết định đòn đánh; bên PHỤ chỉ để đồng bộ nhịp.
+// TRƯỚC KHI gửi state mới, gửi riêng cho MỖI NGƯỜI 1 "round:result" theo
+// đúng góc nhìn của họ — để client hiện thông báo (đúng/sai/quá giờ) rồi
+// mới phát animation, tránh vừa làm quiz vừa thấy ra chưởng.
 function resolveTurn(room) {
   if (room.ended || room.phase !== "battle") return;
   if (room.answerTimer) clearTimeout(room.answerTimer);
 
+  const resolvedTurn = room.turnCounter;
   const primaryId = primaryPlayerId(room);
   const [pidA, pidB] = room.players.map(p => p.playerId);
+  const submittedA = !!room.pendingActions[pidA];
+  const submittedB = !!room.pendingActions[pidB];
   if (!room.pendingActions[pidA]) room.pendingActions[pidA] = { correct: false };
   if (!room.pendingActions[pidB]) room.pendingActions[pidB] = { correct: false };
 
   const defenderId = otherPlayer(room, primaryId).playerId;
+  const attackLanded = !!(room.pendingActions[primaryId] && room.pendingActions[primaryId].correct);
   applyAttack(room, primaryId, defenderId, currentIsAOE(room));
+
+  room.players.forEach(p => {
+    const wasPrimary = p.playerId === primaryId;
+    const submitted = p.playerId === pidA ? submittedA : submittedB;
+    io.to(p.socketId).emit("round:result", {
+      turnCounter: resolvedTurn,
+      wasPrimary,
+      submitted,                                   // có kịp trả lời trước 30s không
+      correct: room.pendingActions[p.playerId].correct,
+      attackLanded: wasPrimary && attackLanded,      // chỉ true nếu ĐÚNG là chính + trả lời đúng
+    });
+  });
 
   room.turnCounter += 1;
   room.pendingActions = {};
@@ -430,6 +451,7 @@ function registerUser(socket, d) {
     searching: existing ? existing.searching : false,
     inRoomId: existing ? existing.inRoomId : null,
     forcedAcceptNext: existing ? existing.forcedAcceptNext : false,
+    declineCount: existing ? existing.declineCount : 0, // đếm dồn số lần từ chối/lờ; đủ FORCE_ACCEPT_AFTER_DECLINES mới set forcedAcceptNext
     queuedChallenge: existing ? existing.queuedChallenge : null,
     lastChallengeAt: existing ? existing.lastChallengeAt : 0,
     chatCounts: existing ? existing.chatCounts : {}, // reset về 0 khi rời hẳn (removeUser) rồi vào lại
@@ -495,14 +517,19 @@ function clearPendingChallengeFor(playerId) {
   if (p) { clearTimeout(p.timer); pendingChallenges.delete(playerId); }
 }
 
-// 10s không phản hồi (hoặc từ chối tay): gắn vé "bắt buộc nhận lần sau".
+// 10 giây không phản hồi (hoặc từ chối tay): +1 vào bộ đếm từ chối. Đủ
+// FORCE_ACCEPT_AFTER_DECLINES (10) LẦN dồn lại mới gắn vé "bắt buộc nhận
+// lần kế tiếp" — không phải cứ 1 lần là bị ép ngay như bản cũ.
 function resolveChallengeTimeout(toPlayerId) {
   const pending = pendingChallenges.get(toPlayerId);
   if (!pending) return;
   clearTimeout(pending.timer);
   pendingChallenges.delete(toPlayerId);
   const target = onlineUsers.get(toPlayerId);
-  if (target) target.forcedAcceptNext = true;
+  if (target) {
+    target.declineCount = (target.declineCount || 0) + 1;
+    if (target.declineCount >= FORCE_ACCEPT_AFTER_DECLINES) target.forcedAcceptNext = true;
+  }
   emitTo(onlineUsers.get(pending.fromId), "challenge:declined", { toPlayerId });
 }
 
@@ -533,6 +560,7 @@ function tryConsumeQueuedChallenge(playerId) {
   target.queuedChallenge = null;
   if (!from || !validForMatch(from)) return; // người mời đã đi/đang bận trận khác
   target.forcedAcceptNext = false;
+  target.declineCount = 0;
   emitTo(target, "challenge:forced", { fromName: from.name });
   createRoom(from, target);
 }
@@ -589,6 +617,19 @@ io.on("connection", socket => {
       if (users.length >= LIST_LIMIT) break;
     }
     ack({ users });
+  });
+
+  // Danh sách các trận đang diễn ra (tab "Đang chơi" ở màn đấu online)
+  on(socket, "rooms:list", (d, ack) => {
+    if (typeof ack !== "function") return;
+    const list = [...rooms.values()]
+      .filter(r => r.phase === "select" || r.phase === "battle")
+      .map(r => ({
+        a: { name: r.players[0].name, className: onlineUsers.get(r.players[0].playerId)?.className || null },
+        b: { name: r.players[1].name, className: onlineUsers.get(r.players[1].playerId)?.className || null },
+        phase: r.phase,
+      }));
+    ack({ rooms: list });
   });
 
   // Hỏi trạng thái của 1 nhóm người cụ thể (danh sách bạn bè)
@@ -686,6 +727,7 @@ io.on("connection", socket => {
     if (target.forcedAcceptNext) {
       if (ts === "idle" || ts === "searching") {
         target.forcedAcceptNext = false;
+        target.declineCount = 0;
         emitTo(target, "challenge:forced", { fromName: me.name });
         createRoom(me, target);
       } else {
@@ -759,6 +801,19 @@ io.on("connection", socket => {
     room.pendingActions[pid] = { correct: !!d.correct };
     const [pidA, pidB] = room.players.map(p => p.playerId);
     if (room.pendingActions[pidA] && room.pendingActions[pidB]) resolveTurn(room);
+  });
+
+  // ---------- RỜI TRẬN CHỦ ĐỘNG (khác với rớt mạng) ----------
+  // Người rời tự trừ điểm ở CLIENT (server không giữ điểm). Server chỉ lo
+  // kết thúc phòng ngay lập tức thay vì bắt đối thủ chờ hết 60s vô ích.
+  on(socket, "battle:leave", () => {
+    const me = getMe(socket);
+    if (!me || !me.inRoomId) return;
+    const room = rooms.get(me.inRoomId);
+    if (!room || room.ended) return;
+    const opp = otherPlayer(room, me.playerId);
+    if (room.phase === "select") cancelRoom(room, "opponent_left");
+    else endRoom(room, opp ? opp.playerId : null, "opponent_left_voluntarily");
   });
 
   // ---------- NỐI LẠI PHÒNG (chuyển trang / rớt mạng) ----------
