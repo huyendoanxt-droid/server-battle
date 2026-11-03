@@ -889,6 +889,7 @@ io.on("connection", socket => {
     }
   });
 });
+require("./pkm_world_server")(io, { onlineUsers, statusOf });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log("PKM server v3 listening on port " + PORT));
