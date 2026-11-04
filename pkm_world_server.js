@@ -2,7 +2,11 @@
  * ============================================================
  * PKM WORLD SERVER — "thế giới" Pokémon theo lớp (module phụ cho server.js)
  * ============================================================
- * Mỗi lớp = 1 phòng (socket.io room "w:<lớp>"), thêm "Sảnh chung" (__hall).
+ * Có 1 "Sảnh chung" (__hall) và các phòng bên trong. Có 2 chế độ (biến môi trường
+ * WORLD_MODE, hoặc sửa thẳng mảng ROOMS bên dưới):
+ *   - guild (mặc định): 3 hội quán Đất / Nước / Lửa
+ *   - class           : mỗi lớp 1 phòng, danh sách lớp lấy từ WORLD_CLASSES
+ *                       (mặc định "1,2,3,4,5"), học sinh tự vào đúng lớp của mình
  * Học sinh tự do đổi phòng. Server chỉ giữ: ai đang ở phòng nào, đứng ở đâu,
  * đang quay mặt hướng nào, Pokémon đại diện (id), trạng thái (rảnh/đang đấu).
  *
@@ -16,6 +20,7 @@
  * 150ms) gửi 1 gói nhỏ cho phòng đó, chỉ gồm những người vừa di chuyển.
  * Chỉnh được bằng biến môi trường:
  *     WORLD_TICK_MS (mặc định 150)   WORLD_ROOM_MAX (mặc định 150 người/phòng)
+ *     WORLD_MODE (guild | class)     WORLD_CLASSES (vd "1,2,3,4,5")
  * ============================================================
  */
 "use strict";
@@ -28,7 +33,19 @@ module.exports = function attachWorld(io, ctx) {
   const MIN_X = 24, MAX_X = WORLD_W - 24, MIN_Y = 72, MAX_Y = WORLD_H - 24;
 
   const HALL = "__hall";
-  const NO_CLASS = "Chưa rõ lớp";
+
+  // ---------- CẤU HÌNH PHÒNG ----------
+  const MODE = (process.env.WORLD_MODE || "guild").toLowerCase();
+  const THEMES = ["earth", "water", "fire"];   // earth = Đất, water = Nước, fire = Lửa
+  const ROOMS = MODE === "class"
+    ? (process.env.WORLD_CLASSES || "1,2,3,4,5").split(",").map(s => s.trim()).filter(Boolean)
+        .map((k, i) => ({ key: k, label: "Lớp " + k, theme: THEMES[i % 3] }))
+    : [
+        { key: "dat",  label: "Hội quán Đất",  theme: "earth" },
+        { key: "nuoc", label: "Hội quán Nước", theme: "water" },
+        { key: "lua",  label: "Hội quán Lửa",  theme: "fire" },
+      ];
+  const ROOM_BY_KEY = new Map(ROOMS.map(r => [r.key, r]));
   const TICK_MS = Number(process.env.WORLD_TICK_MS) || 150;
   const ROOM_MAX = Number(process.env.WORLD_ROOM_MAX) || 150;
   const STATUS_CHECK_MS = 1000;
@@ -61,9 +78,17 @@ module.exports = function attachWorld(io, ctx) {
     sid: m.sid, playerId: m.playerId, name: m.name, className: m.className,
     pkmId: m.pkmId, x: Math.round(m.x), y: Math.round(m.y), dir: m.dir, status: m.lastStatus,
   });
-  function knownClass(key) {
-    for (const u of onlineUsers.values()) if (u.connected && (u.className || NO_CLASS) === key) return true;
-    return false;
+  const sizeOf = key => (worlds.get(key) ? worlds.get(key).size : 0);
+  const roomList = () => [
+    { key: HALL, label: "Sảnh chung", theme: "hall", count: sizeOf(HALL) },
+    ...ROOMS.map(r => ({ key: r.key, label: r.label, theme: r.theme, count: sizeOf(r.key) })),
+  ];
+  // Chế độ "class": học sinh vào thẳng phòng lớp mình (nếu khớp). Còn lại vào Sảnh.
+  function defaultRoom(user) {
+    if (MODE !== "class") return HALL;
+    const c = (user.className || "").trim().toLowerCase();
+    const r = c && ROOMS.find(x => x.key.toLowerCase() === c || x.label.toLowerCase() === c);
+    return r ? r.key : HALL;
   }
 
   function removeMember(m, notify = true) {
@@ -87,9 +112,8 @@ module.exports = function attachWorld(io, ctx) {
       // Chưa gửi presence:hello (hoặc socket này đã bị thay) -> client thử lại sau
       if (!user || user.socketId !== socket.id) return reply({ ok: false, reason: "no_hello" });
 
-      const myKey = user.className || NO_CLASS;
-      const key = str(d.room, 40) || myKey;
-      if (key !== HALL && key !== myKey && !knownClass(key)) return reply({ ok: false, reason: "no_room" });
+      const key = str(d.room, 40) || defaultRoom(user);
+      if (key !== HALL && !ROOM_BY_KEY.has(key)) return reply({ ok: false, reason: "no_room" });
 
       const old = memberOf.get(pid);
       const target = worlds.get(key);
@@ -110,7 +134,7 @@ module.exports = function attachWorld(io, ctx) {
       memberOf.set(pid, m);
       socket.join(sockRoom(key));
       socket.to(sockRoom(key)).emit("world:enter", pub(m));
-      reply({ ok: true, room: key, you: pub(m), members: [...w.values()].map(pub) });
+      reply({ ok: true, room: key, you: pub(m), members: [...w.values()].map(pub), rooms: roomList() });
     });
 
     safe(socket, "world:leave", () => {
@@ -149,13 +173,7 @@ module.exports = function attachWorld(io, ctx) {
 
     // Danh sách phòng + số người đang ở trong thế giới của mỗi phòng
     safe(socket, "world:rooms", (d, ack) => {
-      if (typeof ack !== "function") return;
-      const keys = new Set();
-      for (const u of onlineUsers.values()) if (u.connected) keys.add(u.className || NO_CLASS);
-      for (const k of worlds.keys()) if (k !== HALL) keys.add(k);
-      const classes = [...keys].sort((a, b) => a.localeCompare(b, "vi", { numeric: true }))
-        .map(k => ({ key: k, count: worlds.get(k) ? worlds.get(k).size : 0 }));
-      ack({ rooms: [{ key: HALL, count: worlds.get(HALL) ? worlds.get(HALL).size : 0 }, ...classes] });
+      if (typeof ack === "function") ack({ rooms: roomList() });
     });
 
     socket.on("disconnect", () => {
